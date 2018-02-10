@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2, June 1991.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/gpl-2.0.html>,
+# or in pdf format at <http://www.dhampir.no/stuff/private/gpl-2.0.pdf>
+
+# Copyright 2018 - Øyvind 'bolt' Hvidsten	 <bolt@dhampir.no>
+
+# Description:
+#
+# BashSock is a simple Bash script implementation of the HTTP and WebSocket protocols,
+# roughly in compliance with RFC 6455 ( https://tools.ietf.org/html/rfc6455 )
+#
+# It's designed to be launched from tcpserver (it's in the "ucspi-tcp" package
+# on Debian based distributions) as a stand alone micro web server, in which
+# case it will serve a mostly empty webpage at the root, /, with a short
+# javascript which tells the browser to execute any line that comes through the
+# socket.
+#
+# It can be useful for simple status displays and similar, making what shows up
+# on the page entirely up to the websocket data.
+#
+
+_scriptname="bashsock"
+set -u
+set -e
+
+
+## printing stuff
+function println { printf '%s\n' "$*"; }
+function print { printf '%s' "$*"; }
+
+
+## the help
+function printusage
+{
+cat - >&2 <<EOF
+
+Usage: ${_scriptname} [options] -e </path/to/executable>
+Options:
+  -h
+	Print this helpful (?) text.
+  -e </path/to/executable>
+	After negotiating the websocket connection, the provided executable will be launched.
+	It will be provided with the decoded TEXT MODE messages from the client on stdin,
+	and anything it prints to stdout will be sent, line buffered, as text messages to
+	the client. Binary messages are not supported (yet?)
+  -s <wss://example.com/custom/path/socket>
+    Override the auto generated socket address. This may be required if the server is
+    behind a proxy.
+  -x
+	Set -x, for debugging. Spams a lot.
+
+Example:
+  $0 -e ${HOME}/bashsock-example
+
+EOF
+}
+
+
+## no options?
+if (( $# == 0 )); then
+	printusage
+	exit 0
+fi
+
+
+## options!
+exe=""
+socket_address=""
+OPTIND=1
+while getopts ":he:s:x" opt; do
+	case "$opt" in
+		h) printusage; exit 0 ;;
+		e) exe=$OPTARG ;;
+		s) socket_address=$OPTARG ;;
+		x) set -x ;;
+		[?])
+			println "Unknown option -${OPTARG}" >&2
+			exit 1
+		;;
+		:)	
+			println "Option -${OPTARG} requires an argument" >&2
+			exit 1
+		;;
+	esac
+done
+shift $((OPTIND-1))
+if [[ "${1:-}" = "--" ]]; then shift; fi
+
+
+## sanity
+if [[ -z "$exe" ]]; then
+	println "Missing required option: -e" >&2
+	exit 1
+elif ! [[ -e "$exe" ]]; then
+	println "Not a valid executable: $exe" >&2
+	exit 1
+fi
+
+
+## detect environment
+if [[ -n "${TCPREMOTEIP:-}" ]] && [[ -n "$TCPREMOTEPORT" ]]; then
+	:
+fi
+
+
+## lock file location
+for dir in "/run/shm" "/dev/shm" "${TMP:-"/tmp"}"; do
+	if [[ -w "$dir" ]]; then
+		ws_lock="${dir}/${_scriptname}.$$.lock"
+		break
+	fi
+done
+
+
+## cleanup on exit
+hitlist=()
+trap '{ log "MAIN EXIT"; set +e; set -x; kill -TERM "${hitlist[@]}"; rm "$ws_lock"; } 2>/dev/null' EXIT
+
+
+## lock file test
+if [[ -z "${ws_lock:-}" ]] || ! touch "$ws_lock"; then
+	println "Unable to create temp file :("
+	exit 1
+fi
+rm "$ws_lock"
+
+
+## websocket protocol statics
+WS_FIN=$(( 16#80 ))
+WS_MASK=$(( 16#80 ))
+WS_TEXT=$(( 16#01 ))
+WS_BINARY=$(( 16#02 ))
+WS_QUIT=$(( 16#08 ))
+WS_PING=$(( 16#09 ))
+WS_PONG=$(( 16#0a ))
+
+
+## functions
+function http_response
+{
+	println "HTTP/1.1 $*"
+	println "Server: BashSock github.com/b01t/bashsock"
+	println "Connection: close"
+	println "Content-Type: ${CTYPE:-"text/plain"}; charset=utf-8"
+	println "Sec-WebSocket-Version: 13"
+	println ""
+}
+function bad_request
+{
+	http_response "400 Bad Request"
+	print "Bad Request"
+	exit 0
+}
+function hex { printf "%0$((${2:-1}*2))x" "$1"; }
+function bin2hex { stdbuf -i0 -o0 xxd -p | stdbuf -i0 -o0 tr -d '\n'; }
+function hex2bin { stdbuf -i0 -o0 xxd -p -r; }
+function ws_text
+{
+	local text="$*"
+	local hex="$(print "$text" | bin2hex)"
+	local length=$(( ${#hex} / 2 ))
+	{
+		hex "$((WS_FIN | WS_TEXT))"
+		if (( length <= 125 )); then
+			hex "$length" # just the length
+		elif (( length <= 65535 )); then
+			hex 126 # 16-bit follows
+			hex "$length" 2
+		else
+			hex 127 # 64-bit follows
+			hex "$length" 8
+		fi
+		print "$hex"
+	} | hex2bin | ws_send
+}
+function ws_send
+{
+	while ! (set -C && umask 0077 && >"${ws_lock}") &>/dev/null; do
+		sleep 0.1
+	done
+	local c
+	cat >&${stdout} && c=$? || c=$?
+	rm "$ws_lock"
+	return $c
+}
+function read_int
+{
+	local var=$1 bytes=$2 int
+	read -r -N $((bytes*2)) int
+	printf -v "$var" '%d' "$(( 16#$int ))"
+}
+function ws_read
+{
+	local head len mask fin text_part=false
+	while read_int head 1; do
+
+		## head
+		(( fin = head & WS_FIN )) || :
+		(( head &= 16#0f )) || :
+
+		## length
+		read_int len 1
+		(( mask = len & WS_MASK )) || :
+		(( len &= 16#7f ))
+		if (( len == 126 )); then
+			read_int len 2
+		elif (( len == 127 )); then
+			read_int len 8
+		fi
+
+		## mask
+		if (( mask )); then
+			read_int mask 4
+		fi
+
+		## payload
+		local payload
+		read -r -N $((len*2)) payload
+		payload=$(
+			for ((i=0; i<len; i++ )); do
+				mod="$((3-(i%4)))"
+				xor="$(( (mask>>(mod*8)) & 16#ff ))"
+				byte="${payload:$((i*2)):2}"
+				hex "$(( 16#$byte ^ xor ))"
+			done
+		)
+
+		## process
+		if (( head == WS_TEXT )) || $text_part; then
+			text_part=true
+			print "$payload" | hex2bin
+			if (( fin )); then
+				text_part=false
+				println ""
+			fi
+		elif (( head == WS_QUIT )); then
+			log "<= [QUIT]"
+			{
+				hex "$(( WS_FIN | WS_QUIT ))"
+				hex "$len"
+				print "$payload"
+			} | hex2bin | ws_send
+			log "=> [QUIT]"
+			touch "$ws_lock"
+			kill -TERM $$
+		elif (( head == WS_PING )); then
+			log "<= [PING]"
+			{
+				hex "$(( WS_FIN | WS_PONG ))"
+				hex "$len"
+				print "$payload"
+			} | hex2bin | ws_send
+			log "=> [PONG]"
+		elif (( head == WS_PONG )); then
+			log "<= [PONG]"
+		elif (( head == WS_BINARY )); then
+			log "<= [BINARY]"
+		else
+			log "!! Unsupported header byte: $(hex "$head")"
+		fi
+	done < <(bin2hex)
+}
+function log { println "$$ ${TCPREMOTEIP}:${TCPREMOTEPORT} $*" >&2; }
+
+## rewrite all output to CRLF line endings, saving the original stdout file descriptor as $stdout
+exec {stdout}>&1
+exec > >(
+	perl -e '
+		$| = 1;
+		while ((my $c = getc) ne undef)
+		{
+			if ("$c" eq "\r") { next; }
+			if ("$c" eq "\n") { print "\r\n"; next; }
+			print "$c";
+		}
+	'
+)
+
+
+## very simple web request parsing
+## limited to 32 lines of 256 characters long headers, for the sake of sanity
+path=""
+method=""
+declare -A req=()
+while read -r -t 10 line; do
+	line=$(tr -d '\r\n' <<<"$line")
+	case "${line,,}" in
+		"get "*)
+			read -r line path method <<<"$line" || :
+		;;
+		*": "*)
+			if (( ${#line} > 256 )) || (( ${#req[@]} > 32 )); then
+				bad_request
+			fi
+			read -r key value <<<"$line" || :
+			key=${key,,}
+			req["${key%:*}"]="$value"
+		;;
+		"")
+			break
+		;;
+	esac
+done
+
+
+## we expect a http/1.1 web request. anything else is a bad request
+if [[ "$method" != "HTTP/1.1" ]]; then
+	bad_request
+fi
+
+
+## log the request
+log "<= [GET] $path" >&2
+
+
+## process the request
+case "$path" in
+	"/")
+		CTYPE="text/html" http_response "200 OK"
+
+		## send a very basic html file to start with
+		cat - <<-EOF
+			<html>
+			<meta charset="utf-8" />
+			<head>
+			<script language="javascript" type="text/javascript">
+			var sock = new WebSocket("${socket_address:-"ws://${req["host"]:-"127.0.0.1"}/socket"}", ["madness"]);
+			sock.onmessage = function(evt) { eval(evt.data) }
+			</script>
+			</head>
+			<body>
+			</body>
+			</html>
+		EOF
+	;;
+	"/socket"|"/socket/"*)
+		if [[ ", ${req["sec-websocket-protocol"]}, " != *", madness, "* ]]; then
+			bad_request
+		fi
+
+		## version 13 only, please
+		if [[ ", ${req["sec-websocket-version"]}, " != *", 13, "* ]]; then
+			bad_request
+		fi
+
+		## websocket negotiation
+		magic="258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+		println "HTTP/1.1 101 Switching Protocols"
+		println "Upgrade: websocket"
+		println "Connection: Upgrade"
+		println "Sec-WebSocket-Accept: $(printf '%s' "${req["sec-websocket-key"]}${magic}" | openssl dgst -sha1 -binary | base64 -w0)"
+		println "Sec-WebSocket-Protocol: madness"
+		println ""
+
+		## this closes perl (CRLF)
+		exec >&${stdout}
+
+		## eval all the things!
+		ws_text "
+			sock.onmessage = function(evt)
+			{
+				console.log(evt.data);
+				var el = document.createElement('script');
+				el.id = 'script';
+				el.appendChild(document.createTextNode(evt.data));
+				el.appendChild(document.createTextNode('document.body.removeChild(document.getElementById(\'script\'));'));
+				document.body.appendChild(el);
+			};
+		"
+
+		## send a ping every 300 seconds
+		(
+			while sleep 300; do
+				log "=> [PING]"
+				{
+					hex "$(( WS_FIN | WS_PING ))"
+					hex "2"
+					print ":D" | bin2hex
+				} | hex2bin | ws_send
+			done
+		) &
+		hitlist+=( $! )
+
+		## read input, do cool stuff, write output
+		"$exe" "$path" < <(
+			ws_read |
+			while read -r line; do log "<< $line"; println "$line"; done
+		) | while read -r line; do log ">> $line"; ws_text "$line"; done &
+		hitlist+=( $! )
+		wait
+	;;
+	*)
+		http_response "404 Not Found"
+		print "Not Found"
+	;;
+esac
+
+
+
+# vim: tabstop=4:softtabstop=4:shiftwidth=4:noexpandtab

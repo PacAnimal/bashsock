@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2, June 1991.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/gpl-2.0.html>,
+# or in pdf format at <http://www.dhampir.no/stuff/private/gpl-2.0.pdf>
+
+# Copyright 2018 - Øyvind 'bolt' Hvidsten	 <bolt@dhampir.no>
+
+# Description:
+#
+# Example script for BashSock
+# It doesn't do much, but it will inform you of just how cool web sockets are
+#
+
+path=$1
+
+cat - <<-EOF
+	sock.send('INIT');
+	document.title = "SPAZ!";
+	var body = document.body;
+	body.style.backgroundColor = "#000";
+	var p = document.createElement('p');
+	p.style.color = "#EEE";
+	p.style.fontSize = "128px";
+	p.style.fontFamily = "sans-serif";
+	p.style.textAlign = "center";
+	p.style.padding = "0 0 0 0";
+	p.style.margin = "0 0 0 0";
+
+	body.appendChild(p);
+EOF
+
+(
+	while true; do
+		println 'p.innerText = "WEB";'
+		sleep 1
+		println 'p.innerText = "SOCKETS";'
+		sleep 1
+		println 'p.innerText = "ARE";'
+		sleep 1
+		println 'p.innerText = "COOL";'
+		sleep 1
+	done
+) &
+
+while read -r line; do
+	:
+done
+
+
+
+# vim: tabstop=4:softtabstop=4:shiftwidth=4:noexpandtab
