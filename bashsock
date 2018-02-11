@@ -166,9 +166,9 @@ function bin2hex { stdbuf -i0 -o0 xxd -p | stdbuf -i0 -o0 tr -d '\n'; }
 function hex2bin { stdbuf -i0 -o0 xxd -p -r; }
 function ws_text
 {
-	local text="$*"
-	local hex="$(print "$text" | bin2hex)"
-	local length=$(( ${#hex} / 2 ))
+	local text="$*" hex length
+	hex="$(print "$text" | bin2hex)"
+	length=$(( ${#hex} / 2 ))
 	{
 		hex "$((WS_FIN | WS_TEXT))"
 		if (( length <= 125 )); then
@@ -189,7 +189,7 @@ function ws_send
 		sleep 0.1
 	done
 	local c
-	cat >&${stdout} && c=$? || c=$?
+	cat >&"$stdout" && c=$? || c=$?
 	rm "$ws_lock"
 	return $c
 }
@@ -329,12 +329,13 @@ case "$path" in
 		CTYPE="text/html" http_response "200 OK"
 
 		## send a very basic html file to start with
+		socket="${socket_address:-"ws://${req["host"]}/socket"}"
 		cat - <<-EOF
 			<html>
 			<meta charset="utf-8" />
 			<head>
 			<script language="javascript" type="text/javascript">
-			var sock = new WebSocket("${socket_address:-"ws://${req["host"]:-"127.0.0.1"}/socket"}", ["madness"]);
+			var sock = new WebSocket("${socket}", ["madness"]);
 			sock.onmessage = function(evt) { eval(evt.data) }
 			</script>
 			</head>
