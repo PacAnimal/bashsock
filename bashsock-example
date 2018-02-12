@@ -22,12 +22,17 @@
 
 path=$1
 
+function println { printf '%s\n' "$*"; }
+function print { printf '%s' "$*"; }
+
 cat - <<-EOF
 	sock.send('INIT');
 	document.title = "SPAZ!";
 	var body = document.body;
 	body.style.backgroundColor = "#000";
+	Array.from(document.getElementsByClassName("spawn")).forEach(function(element, index, array) { element.parentNode.removeChild(element); });
 	var p = document.createElement('p');
+	p.className = "spawn";
 	p.style.color = "#EEE";
 	p.style.fontSize = "128px";
 	p.style.fontFamily = "sans-serif";

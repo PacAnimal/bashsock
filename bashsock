@@ -335,8 +335,12 @@ case "$path" in
 			<meta charset="utf-8" />
 			<head>
 			<script language="javascript" type="text/javascript">
-			var sock = new WebSocket("${socket}", ["madness"]);
-			sock.onmessage = function(evt) { eval(evt.data) }
+			var sock;
+			function ws_connect() {
+				sock = new WebSocket("${socket}", ["madness"]);
+				sock.onclose = function(evt) { setTimeout(ws_connect, 5000); }
+				sock.onmessage = function(evt) { eval(evt.data); }
+			}; ws_connect();
 			</script>
 			</head>
 			<body>
